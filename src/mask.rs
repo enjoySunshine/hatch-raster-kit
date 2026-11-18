@@ -9,14 +9,14 @@ use tiny_skia_path::NoStdFloat;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use tiny_skia_path::{IntRect, IntSize, Path, Scalar, Transform};
+use tiny_skia_path::{IntRect, IntSize, Path, Scalar, Stroke, Transform};
 
 use crate::geom::IntSizeExt;
-use crate::painter::DrawTiler;
+use crate::painter::{render_stroke, DrawTiler, StrokeSurface};
 use crate::pipeline::RasterPipelineBlitter;
 use crate::pixmap::SubPixmapMut;
 use crate::scan;
-use crate::{FillRule, PixmapRef};
+use crate::{FillRule, LineCap, Paint, PixmapRef};
 
 /// A mask type.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -346,6 +346,34 @@ impl Mask {
         }
     }
 
+    /// Draws a stroked path onto the mask.
+    ///
+    /// In terms of RGB (no alpha) image, draws a white stroke on top of a black mask.
+    ///
+    /// The stroke is rasterized with the exact same pipeline that a color
+    /// [`crate::PixmapMut`] uses — including hairline coverage, dashing and
+    /// large-pixmap tiling. Consequently a thin hairline writes the same
+    /// coverage values here as it writes into the alpha channel of a color
+    /// pixmap painted with a solid color of the given `opacity` (0..=255),
+    /// instead of being approximated by an expanded outline.
+    ///
+    /// Pass 255 for an opaque stroke.
+    ///
+    /// Doesn't reset the existing mask content and draws the stroke on top of existing data.
+    pub fn stroke_path(
+        &mut self,
+        path: &Path,
+        stroke: &Stroke,
+        anti_alias: bool,
+        opacity: u8,
+        transform: Transform,
+    ) {
+        let mut paint = Paint::default();
+        paint.anti_alias = anti_alias;
+        paint.set_color_rgba8(255, 255, 255, opacity);
+        render_stroke(self, path, &paint, stroke, transform, None);
+    }
+
     /// Intersects the provided path with the current clipping path.
     ///
     /// A temporary mask with the same size as the current one will be created.
@@ -384,6 +412,53 @@ impl core::fmt::Debug for Mask {
             .field("width", &self.size.width())
             .field("height", &self.size.height())
             .finish()
+    }
+}
+
+impl StrokeSurface for Mask {
+    fn surface_width(&self) -> u32 {
+        self.width()
+    }
+
+    fn surface_height(&self) -> u32 {
+        self.height()
+    }
+
+    fn stroke_hairline_tile(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        line_cap: LineCap,
+        _clip_mask: Option<SubMaskRef>,
+        source_alpha: u8,
+    ) {
+        let clip = self.size.to_screen_int_rect(0, 0);
+        let mut subpix = self.as_subpixmap();
+        // `source_alpha` already combines the solid paint alpha with the
+        // hairline pre-scale, so the mask stores the same coverage the color
+        // pixmap writes into its alpha channel.
+        let mut blitter =
+            match RasterPipelineBlitter::new_mask_with_alpha(&mut subpix, source_alpha) {
+                Some(v) => v,
+                None => return,
+            };
+        if paint.anti_alias {
+            scan::hairline_aa::stroke_path(path, line_cap, &clip, &mut blitter);
+        } else {
+            scan::hairline::stroke_path(path, line_cap, &clip, &mut blitter);
+        }
+    }
+
+    fn fill_stroke_outline(
+        &mut self,
+        path: &Path,
+        _paint: &Paint,
+        transform: Transform,
+        _clip_mask: Option<&Mask>,
+    ) {
+        // The outlined stroke is a regular filled path; reuse the (already
+        // tiling-aware) mask fill so wide strokes stay consistent as well.
+        self.fill_path(path, FillRule::Winding, _paint.anti_alias, transform);
     }
 }
 

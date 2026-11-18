@@ -334,118 +334,11 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
-        if stroke.width < 0.0 {
-            log::warn!("negative stroke width isn't allowed");
-            return;
-        }
-
-        let res_scale = PathStroker::compute_resolution_scale(&transform);
-
-        let dash_path;
-        let path = if let Some(ref dash) = stroke.dash {
-            dash_path = match path.dash(dash, res_scale) {
-                Some(v) => v,
-                None => {
-                    log::warn!("path dashing failed");
-                    return;
-                }
-            };
-            &dash_path
-        } else {
-            path
-        };
-
-        if let Some(coverage) = treat_as_hairline(paint, stroke, transform) {
-            let mut paint = paint.clone();
-            if coverage == 1.0 {
-                // No changes to the `paint`.
-            } else if paint.blend_mode.should_pre_scale_coverage() {
-                // This is the old technique, which we preserve for now so
-                // we don't change previous results (testing)
-                // the new way seems fine, its just (a tiny bit) different.
-                let scale = (coverage * 256.0) as i32;
-                let new_alpha = (255 * scale) >> 8;
-                paint.shader.apply_opacity(new_alpha as f32 / 255.0);
-            }
-
-            if let Some(tiler) = DrawTiler::new(self.width(), self.height()) {
-                let mut path = path.clone();
-                let mut paint = paint.clone();
-
-                if !transform.is_identity() {
-                    paint.shader.transform(transform);
-                    path = match path.transform(transform) {
-                        Some(v) => v,
-                        None => {
-                            log::warn!("path transformation failed");
-                            return;
-                        }
-                    };
-                }
-
-                for tile in tiler {
-                    let ts = Transform::from_translate(-(tile.x() as f32), -(tile.y() as f32));
-                    path = match path.transform(ts) {
-                        Some(v) => v,
-                        None => {
-                            log::warn!("path transformation failed");
-                            return;
-                        }
-                    };
-                    paint.shader.transform(ts);
-
-                    let mut subpix = match self.subpixmap(tile.to_int_rect()) {
-                        Some(v) => v,
-                        None => continue, // technically unreachable
-                    };
-                    let submask = mask.and_then(|mask| mask.submask(tile.to_int_rect()));
-
-                    // We're ignoring "errors" here, because `stroke_hairline` will return `None`
-                    // when rendering a tile that doesn't have a path on it.
-                    // Which is not an error in this case.
-                    Self::stroke_hairline(&path, &paint, stroke.line_cap, submask, &mut subpix);
-
-                    let ts = Transform::from_translate(tile.x() as f32, tile.y() as f32);
-                    path = match path.transform(ts) {
-                        Some(v) => v,
-                        None => return,
-                    };
-                    paint.shader.transform(ts);
-                }
-            } else {
-                let subpix = &mut self.as_subpixmap();
-                let submask = mask.map(|mask| mask.as_submask());
-                if !transform.is_identity() {
-                    paint.shader.transform(transform);
-
-                    let path = match path.clone().transform(transform) {
-                        Some(v) => v,
-                        None => {
-                            log::warn!("path transformation failed");
-                            return;
-                        }
-                    };
-
-                    Self::stroke_hairline(&path, &paint, stroke.line_cap, submask, subpix);
-                } else {
-                    Self::stroke_hairline(path, &paint, stroke.line_cap, submask, subpix);
-                }
-            }
-        } else {
-            let path = match path.stroke(stroke, res_scale) {
-                Some(v) => v,
-                None => {
-                    log::warn!("path stroking failed");
-                    return;
-                }
-            };
-
-            self.fill_path(&path, paint, FillRule::Winding, transform, mask);
-        }
+        render_stroke(self, path, paint, stroke, transform, mask);
     }
 
     /// A stroking for paths with subpixel/hairline width.
-    fn stroke_hairline(
+    pub(crate) fn stroke_hairline(
         path: &Path,
         paint: &Paint,
         line_cap: LineCap,
@@ -539,6 +432,204 @@ impl PixmapMut<'_> {
     }
 }
 
+/// A surface that can be stroked into.
+///
+/// Both the color [`PixmapMut`] and the coverage [`crate::Mask`] implement this
+/// trait, so that the whole stroking pipeline — dashing, hairline detection,
+/// resolution scaling and large-pixmap tiling — is shared between them. This
+/// guarantees that a thin stroke produces the same coverage in a mask as it
+/// does in the alpha channel of a color pixmap.
+pub(crate) trait StrokeSurface {
+    fn surface_width(&self) -> u32;
+    fn surface_height(&self) -> u32;
+
+    /// Rasterizes a hairline (a single modulated scan line) into one tile.
+    ///
+    /// `source_alpha` is the full effective source coverage (0..=255), already
+    /// combining the paint alpha with the hairline pre-scale. Color pixmaps
+    /// ignore it because their paint carries the same value; masks use it so
+    /// their stored coverage matches the color path's alpha byte.
+    fn stroke_hairline_tile(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        line_cap: LineCap,
+        clip_mask: Option<SubMaskRef>,
+        source_alpha: u8,
+    );
+
+    /// Fills an already-stroked outline path (used for strokes wider than a hairline).
+    fn fill_stroke_outline(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        transform: Transform,
+        clip_mask: Option<&Mask>,
+    );
+}
+
+impl<'b> StrokeSurface for PixmapMut<'b> {
+    fn surface_width(&self) -> u32 {
+        self.width()
+    }
+
+    fn surface_height(&self) -> u32 {
+        self.height()
+    }
+
+    fn stroke_hairline_tile(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        line_cap: LineCap,
+        clip_mask: Option<SubMaskRef>,
+        _source_alpha: u8,
+    ) {
+        let mut subpix = self.as_subpixmap();
+        PixmapMut::stroke_hairline(path, paint, line_cap, clip_mask, &mut subpix);
+    }
+
+    fn fill_stroke_outline(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        transform: Transform,
+        clip_mask: Option<&Mask>,
+    ) {
+        self.fill_path(path, paint, FillRule::Winding, transform, clip_mask);
+    }
+}
+
+/// Shared stroking pipeline used by both color pixmaps and coverage masks.
+pub(crate) fn render_stroke<S: StrokeSurface>(
+    surface: &mut S,
+    path: &Path,
+    paint: &Paint,
+    stroke: &Stroke,
+    transform: Transform,
+    clip_mask: Option<&Mask>,
+) {
+    if stroke.width < 0.0 {
+        log::warn!("negative stroke width isn't allowed");
+        return;
+    }
+
+    // Dashing is expanded on the whole path before any tiling happens, so the
+    // ink/gap pattern is continuous across tile boundaries.
+    let res_scale = PathStroker::compute_resolution_scale(&transform);
+
+    let dash_path;
+    let path = if let Some(ref dash) = stroke.dash {
+        dash_path = match path.dash(dash, res_scale) {
+            Some(v) => v,
+            None => {
+                log::warn!("path dashing failed");
+                return;
+            }
+        };
+        &dash_path
+    } else {
+        path
+    };
+
+    // Hairline vs. outlined-stroke decision is made on the original transform,
+    // together with dash expansion and the resolution scale, before tiling.
+    if let Some(coverage) = treat_as_hairline(paint, stroke, transform) {
+        // Effective source coverage for a coverage mask: the solid paint's own
+        // alpha combined with the hairline sub-pixel coverage. Non-solid shaders
+        // have no single scalar alpha, so they stay fully opaque in a mask.
+        let source_alpha = match paint.shader {
+            Shader::SolidColor(ref c) => {
+                let paint_alpha = (c.alpha() * 255.0).round() as u8;
+                if coverage >= 1.0 {
+                    paint_alpha
+                } else {
+                    // Mirror the integer pre-scale applied to the color paint.
+                    let scale = (coverage * 256.0) as i32;
+                    let prescaled = ((255 * scale) >> 8) as u8;
+                    crate::color::premultiply_u8(paint_alpha, prescaled)
+                }
+            }
+            _ => 255,
+        };
+
+        let mut paint = paint.clone();
+        if coverage == 1.0 {
+            // No changes to the `paint`.
+        } else if paint.blend_mode.should_pre_scale_coverage() {
+            // This is the old technique, which we preserve for now so
+            // we don't change previous results (testing)
+            // the new way seems fine, its just (a tiny bit) different.
+            let scale = (coverage * 256.0) as i32;
+            let new_alpha = (255 * scale) >> 8;
+            paint.shader.apply_opacity(new_alpha as f32 / 255.0);
+        }
+
+        if let Some(tiler) = DrawTiler::new(surface.surface_width(), surface.surface_height()) {
+            let mut path = path.clone();
+            let mut paint = paint.clone();
+
+            if !transform.is_identity() {
+                paint.shader.transform(transform);
+                path = match path.transform(transform) {
+                    Some(v) => v,
+                    None => {
+                        log::warn!("path transformation failed");
+                        return;
+                    }
+                };
+            }
+
+            for tile in tiler {
+                let ts = Transform::from_translate(-(tile.x() as f32), -(tile.y() as f32));
+                path = match path.transform(ts) {
+                    Some(v) => v,
+                    None => {
+                        log::warn!("path transformation failed");
+                        return;
+                    }
+                };
+                paint.shader.transform(ts);
+
+                let submask = clip_mask.and_then(|mask| mask.submask(tile.to_int_rect()));
+                surface.stroke_hairline_tile(&path, &paint, stroke.line_cap, submask, source_alpha);
+
+                let ts = Transform::from_translate(tile.x() as f32, tile.y() as f32);
+                path = match path.transform(ts) {
+                    Some(v) => v,
+                    None => return,
+                };
+                paint.shader.transform(ts);
+            }
+        } else if !transform.is_identity() {
+            paint.shader.transform(transform);
+            let path = match path.clone().transform(transform) {
+                Some(v) => v,
+                None => {
+                    log::warn!("path transformation failed");
+                    return;
+                }
+            };
+
+            let submask = clip_mask.map(|mask| mask.as_submask());
+            surface.stroke_hairline_tile(&path, &paint, stroke.line_cap, submask, source_alpha);
+        } else {
+            let submask = clip_mask.map(|mask| mask.as_submask());
+            surface.stroke_hairline_tile(path, &paint, stroke.line_cap, submask, source_alpha);
+        }
+    } else {
+        let path = match path.stroke(stroke, res_scale) {
+            Some(v) => v,
+            None => {
+                log::warn!("path stroking failed");
+                return;
+            }
+        };
+
+        surface.fill_stroke_outline(&path, paint, transform, clip_mask);
+    }
+}
+
 fn treat_as_hairline(paint: &Paint, stroke: &Stroke, mut ts: Transform) -> Option<f32> {
     fn fast_len(p: Point) -> f32 {
         let mut x = p.x.abs();
@@ -565,6 +656,12 @@ fn treat_as_hairline(paint: &Paint, stroke: &Stroke, mut ts: Transform) -> Optio
     ts.ty = 0.0;
 
     // We need to try to fake a thick-stroke with a modulated hairline.
+    //
+    // A hairline is kept as long as the transformed width stays at or below one
+    // pixel on *at least one* axis. When an anisotropic scale stretches the
+    // stroke in one direction while it stays thin in the other, the stroke is
+    // still a single scan line; only when the stroke is wider than one pixel on
+    // both axes do we fall back to a regular outlined (filled) stroke.
     let mut points = [
         Point::from_xy(stroke.width, 0.0),
         Point::from_xy(0.0, stroke.width),
@@ -574,8 +671,16 @@ fn treat_as_hairline(paint: &Paint, stroke: &Stroke, mut ts: Transform) -> Optio
     let len0 = fast_len(points[0]);
     let len1 = fast_len(points[1]);
 
-    if len0 <= 1.0 && len1 <= 1.0 {
-        return Some(len0.ave(len1));
+    if len0 <= 1.0 || len1 <= 1.0 {
+        let thin = len0.min(len1);
+        let wide = len0.max(len1);
+        // The coverage is driven by the thin axis (the one that still behaves
+        // like a hairline), with a small extra term from the part of the wide
+        // axis that exceeds a full pixel. For a uniform transform both axes are
+        // equal so `wide <= 1` and this reduces to the original `thin` coverage;
+        // the `/ 12` extra term only changes the anisotropic case (the wide axis
+        // only reaches it once it is already over one pixel wide).
+        return Some((thin + (wide - 1.0).max(0.0) / 12.0).min(1.0));
     }
 
     None
@@ -677,6 +782,61 @@ impl Iterator for DrawTiler {
 mod tests {
     use super::*;
     const MAX_DIM: u32 = DrawTiler::MAX_DIMENSIONS;
+
+    #[test]
+    fn mask_hairline_matches_color_coverage() {
+        use crate::Mask;
+        let mut pb = PathBuilder::new();
+        pb.move_to(20.0, 30.0);
+        pb.line_to(180.0, 30.0);
+        let path = pb.finish().unwrap();
+        let mut stroke = Stroke::default();
+        stroke.width = 0.4;
+        stroke.line_cap = LineCap::Butt;
+        let mut mask = Mask::new(200, 60).unwrap();
+        mask.stroke_path(&path, &stroke, true, 200, Transform::identity());
+        // Same alpha byte the color pixmap writes for this hairline.
+        assert_eq!(mask.data()[30 * 200 + 100], 40);
+    }
+
+    #[test]
+    fn hairline_coverage_identity_thin() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(50, 127, 150, 200);
+        let mut stroke = Stroke::default();
+        stroke.width = 0.4;
+        let cov = treat_as_hairline(&paint, &stroke, Transform::identity()).unwrap();
+        assert!((cov - 0.4).abs() < 1e-6, "cov={cov}");
+
+        let scale = (cov * 256.0) as i32;
+        let prescaled = ((255 * scale) >> 8) as u8;
+        let source = crate::color::premultiply_u8(200, prescaled);
+        assert_eq!(prescaled, 101);
+        assert_eq!(source, 79);
+    }
+
+    #[test]
+    fn hairline_coverage_anisotropic() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(50, 127, 150, 200);
+        let mut stroke = Stroke::default();
+        stroke.width = 0.8;
+        // x2 horizontally, /2 vertically: the x axis becomes 1.6px wide while the
+        // y axis stays 0.4px, so the stroke remains a (modulated) hairline.
+        let ts = Transform::from_row(2.0, 0.0, 0.0, 0.5, 0.0, 0.0);
+        let cov = treat_as_hairline(&paint, &stroke, ts).unwrap();
+        assert!((cov - 0.45).abs() < 1e-6, "cov={cov}");
+    }
+
+    #[test]
+    fn hairline_outline_when_both_axes_wide() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(50, 127, 150, 200);
+        let mut stroke = Stroke::default();
+        stroke.width = 2.0;
+        // Both axes map the stroke well above one pixel: not a hairline.
+        assert!(treat_as_hairline(&paint, &stroke, Transform::identity()).is_none());
+    }
 
     #[test]
     fn skip() {

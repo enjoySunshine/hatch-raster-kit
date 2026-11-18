@@ -212,7 +212,19 @@ impl<'a, 'b: 'a> RasterPipelineBlitter<'a, 'b> {
     }
 
     pub fn new_mask(pixmap: &'a mut SubPixmapMut<'b>) -> Option<Self> {
-        let color = Color::WHITE.premultiply();
+        // A plain mask fill is always a fully opaque white coverage.
+        Self::new_mask_with_alpha(pixmap, 255)
+    }
+
+    /// Creates a mask blitter whose coverage is additionally modulated by a
+    /// source `alpha` (0..=255).
+    ///
+    /// This lets a mask follow the exact same stroke coverage as a color
+    /// pixmap: a hairline already pre-scales its paint by its sub-pixel
+    /// coverage, and passing the resulting source alpha here makes the mask
+    /// store the same final coverage byte the color path writes.
+    pub fn new_mask_with_alpha(pixmap: &'a mut SubPixmapMut<'b>, alpha: u8) -> Option<Self> {
+        let color = Color::from_rgba8(255, 255, 255, alpha).premultiply();
 
         let memset2d_color = Some(color.to_color_u8());
 
