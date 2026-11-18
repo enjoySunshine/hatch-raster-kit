@@ -1,0 +1,10 @@
+/target
+.directory
+.DS_Store
+/image.png
+/.vscode
+.env
+.env.*
+*.pem
+*.key
+
